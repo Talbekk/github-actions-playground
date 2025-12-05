@@ -1,18 +1,99 @@
-name: GitHub Actions Demo
-run-name: ${{ github.actor }} is testing out GitHub Actions 🚀
-on: [push]
+name: Auto-Merge Approved PRs
+
+on:
+  workflow_dispatch: # Allow manual triggering only
+
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
-  Explore-GitHub-Actions:
+  auto-merge:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "🎉 The job was automatically triggered by a ${{ github.event_name }} event."
-      - run: echo "🐧 This job is now running on a ${{ runner.os }} server hosted by GitHub!"
-      - run: echo "🔎 The name of your branch is ${{ github.ref }} and your repository is ${{ github.repository }}."
-      - name: Check out repository code
-        uses: actions/checkout@v5
-      - run: echo "💡 The ${{ github.repository }} repository has been cloned to the runner."
-      - run: echo "🖥️ The workflow is now ready to test your code on the runner."
-      - name: List files in the repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Git
         run: |
-          ls ${{ github.workspace }}
-      - run: echo "🍏 This job's status is ${{ job.status }}."
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Process Approved PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get all open PRs
+          prs=$(gh pr list --state open --json number,title,labels,reviewDecision,mergeable --limit 100)
+          
+          echo "$prs" | jq -c '.[]' | while read -r pr; do
+            pr_number=$(echo "$pr" | jq -r '.number')
+            pr_title=$(echo "$pr" | jq -r '.title')
+            review_decision=$(echo "$pr" | jq -r '.reviewDecision')
+            mergeable=$(echo "$pr" | jq -r '.mergeable')
+            labels=$(echo "$pr" | jq -r '.labels[].name')
+            
+            echo "Processing PR #$pr_number: $pr_title"
+            
+            # Check if PR has "DO NOT MERGE" label
+            if echo "$labels" | grep -qi "do not merge"; then
+              echo "  ⏭️  Skipping: Has 'DO NOT MERGE' label"
+              continue
+            fi
+            
+            # Check if PR is approved
+            if [ "$review_decision" != "APPROVED" ]; then
+              echo "  ⏭️  Skipping: Not approved (status: $review_decision)"
+              continue
+            fi
+            
+            # Check if PR has conflicts
+            if [ "$mergeable" = "CONFLICTING" ]; then
+              echo "  ⏭️  Skipping: Has merge conflicts"
+              continue
+            fi
+            
+            # Get PR details for the tag
+            pr_body=$(gh pr view "$pr_number" --json body --jq '.body' | head -c 500)
+            pr_author=$(gh pr view "$pr_number" --json author --jq '.author.login')
+            
+            echo "  ✅ Attempting to merge and rebase PR #$pr_number"
+            
+            # Merge the PR with rebase
+            if gh pr merge "$pr_number" --rebase --auto=false; then
+              echo "  ✅ Successfully merged PR #$pr_number"
+              
+              # Fetch the latest changes
+              git fetch origin
+              git checkout main
+              git pull origin main
+              
+              # Create a tag with PR number and summary in kebab-case
+              tag_name=$(echo "pr-$pr_number-$pr_title" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
+              tag_message="PR #$pr_number: $pr_title
+              
+              Author: @$pr_author
+              
+              Summary:
+              ${pr_body:0:500}"
+              
+              # Create and push the tag
+              git tag -a "$tag_name" -m "$tag_message"
+              git push origin "$tag_name"
+              
+              echo "  🏷️  Created tag: $tag_name"
+            else
+              echo "  ❌ Failed to merge PR #$pr_number"
+            fi
+            
+            # Add a small delay between PRs
+            sleep 2
+          done
+
+      - name: Summary
+        run: |
+          echo "Auto-merge process completed"
+          echo "Tagged merges can be viewed with: git tag -l 'pr-*'"
