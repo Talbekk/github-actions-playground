@@ -6,6 +6,8 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  checks: read
+  statuses: read
 
 jobs:
   auto-merge:
@@ -27,12 +29,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Get all open PRs
-          prs=$(gh pr list --state open --json number,title,labels,reviewDecision,mergeable --limit 100)
+          prs=$(gh pr list --state open --json number,title,labels,mergeable --limit 100)
           
           echo "$prs" | jq -c '.[]' | while read -r pr; do
             pr_number=$(echo "$pr" | jq -r '.number')
             pr_title=$(echo "$pr" | jq -r '.title')
-            review_decision=$(echo "$pr" | jq -r '.reviewDecision')
             mergeable=$(echo "$pr" | jq -r '.mergeable')
             labels=$(echo "$pr" | jq -r '.labels[].name')
             
@@ -44,11 +45,15 @@ jobs:
               continue
             fi
             
-            # Check if PR is approved
-            if [ "$review_decision" != "APPROVED" ]; then
-              echo "  ⏭️  Skipping: Not approved (status: $review_decision)"
+            # Get review status separately
+            reviews=$(gh pr view "$pr_number" --json reviews --jq '.reviews[] | select(.state == "APPROVED") | .author.login' | wc -l)
+            
+            if [ "$reviews" -lt 1 ]; then
+              echo "  ⏭️  Skipping: Not approved (approvals: $reviews)"
               continue
             fi
+            
+            echo "  ✅ PR has $reviews approval(s)"
             
             # Check if PR has conflicts
             if [ "$mergeable" = "CONFLICTING" ]; then
