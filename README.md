@@ -13,6 +13,8 @@ Blah blah blah!
 
 ## Expanding the ESLint configuration
 
+Hello out there!
+
 If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
 
 ```js
