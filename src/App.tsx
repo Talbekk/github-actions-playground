@@ -29,7 +29,7 @@ function App() {
         Click on the Vite and React logos to learn more about what we have in store.
       </p>
     </>
-  )
+  );
 }
 
-export default App
+export default App;
