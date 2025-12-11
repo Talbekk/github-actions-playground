@@ -19,6 +19,15 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
       - name: Setup Git
         run: |
           git config user.name "github-actions[bot]"
@@ -28,6 +37,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Track if any PRs were merged
+          merged_count=0
+          merged_prs=""
+          
           # Get all open PRs
           prs=$(gh pr list --state open --json number,title,labels,mergeable --limit 100)
           
@@ -71,6 +84,10 @@ jobs:
             if gh pr merge "$pr_number" --rebase --auto=false; then
               echo "  ✅ Successfully merged PR #$pr_number"
               
+              # Track merged PR
+              merged_count=$((merged_count + 1))
+              merged_prs="${merged_prs}#${pr_number} "
+              
               # Fetch the latest changes
               git fetch origin
               git checkout main
@@ -97,6 +114,57 @@ jobs:
             # Add a small delay between PRs
             sleep 2
           done
+          
+          # Store merged count for next step
+          echo "$merged_count" > /tmp/merged_count.txt
+          echo "$merged_prs" > /tmp/merged_prs.txt
+
+      - name: Update Build Number
+        if: always()
+        run: |
+          # Check if any PRs were merged
+          if [ -f /tmp/merged_count.txt ]; then
+            merged_count=$(cat /tmp/merged_count.txt)
+            merged_prs=$(cat /tmp/merged_prs.txt)
+          else
+            merged_count=0
+          fi
+          
+          if [ "$merged_count" -gt 0 ]; then
+            echo "📦 $merged_count PR(s) were merged: $merged_prs"
+            echo "📦 Updating build number..."
+            
+            # Ensure we're on main with latest changes
+            git checkout main
+            git pull origin main
+            
+            # Get current build number from package.json (or set to 0 if not exists)
+            current_build=$(jq -r '.build // 0' package.json)
+            new_build=$((current_build + 1))
+            
+            echo "📦 Updating build number from $current_build to $new_build"
+            
+            # Update build number in package.json
+            jq --arg build "$new_build" '.build = ($build | tonumber)' package.json > package.json.tmp && mv package.json.tmp package.json
+            
+            # Run npm build
+            echo "🔨 Running npm run build"
+            npm run build
+            
+            # Commit build number updates and build artifacts
+            git add -A
+            if git diff --staged --quiet; then
+              echo "ℹ️  No changes to commit from build"
+            else
+              git commit -m "chore: bump build number to $new_build [skip ci]
+              
+              Automated build number update after merging PRs: $merged_prs"
+              git push origin main
+              echo "✅ Committed and pushed build updates"
+            fi
+          else
+            echo "ℹ️  No PRs were merged, skipping build number update"
+          fi
 
       - name: Summary
         run: |
