@@ -15,6 +15,8 @@ Blah blah blah!
 
 Hello out there!
 
+Sweet times all round!
+
 If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
 
 ```js
