@@ -3,17 +3,30 @@ on:
   pull_request:
     branches: [ azure-dev ]
   workflow_dispatch: # Allows manual runs
+    inputs:
+      pr_number:
+        description: "PR number to approve"
+        type: string
+        required: true
 
 jobs:
   auto-approve:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' && github.event.pull_request.user.login == github.repository_owner
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.user.login == github.repository_owner
     permissions:
       pull-requests: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - name: Determine PR number
+        id: pr
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "number=${{ inputs.pr_number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          fi
       - name: Auto-approve PR
-        run: gh pr review ${{ github.event.pull_request.number }} --approve
+        run: gh pr review ${{ steps.pr.outputs.number }} --approve
         env:
-          GITHUB_TOKEN: ${{ github.token }}   
+          GITHUB_TOKEN: ${{ github.token }}
