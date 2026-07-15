@@ -61,6 +61,7 @@ env:
   TEST_BRANCH: azure-dev
   READY_LABEL: ready for testing
   MERGED_LABEL: on azure-dev
+  QAQC_LABEL: requires QAQC
   VERSION_FILES: source2.handlebars layouts/empty.handlebars admin.handlebars
   COMMIT_MSG: "chore: rebuild assets, increment build number"
   GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
@@ -104,10 +105,12 @@ jobs:
           fi
 
           for n in $PR_NUMBERS; do
-            meta=$(gh pr view "$n" --json title,author,reviewDecision)
+            meta=$(gh pr view "$n" --json title,author,reviewDecision,baseRefName,labels)
             title=$(jq -r '.title' <<<"$meta")
             author=$(jq -r '.author.login' <<<"$meta")
             decision=$(jq -r '.reviewDecision' <<<"$meta")
+            base_ref=$(jq -r '.baseRefName' <<<"$meta")
+            has_qaqc=$(jq -r --arg l "$QAQC_LABEL" '[.labels[].name] | any(. == $l)' <<<"$meta")
 
             # GitHub computes mergeability lazily - retry UNKNOWN a few times
             mergeable=UNKNOWN
@@ -117,7 +120,11 @@ jobs:
               sleep 3
             done
 
-            if [ "$decision" != "APPROVED" ]; then
+            if [ "$base_ref" != "$BASE_BRANCH" ]; then
+              echo "#$n ($title) - targets \"$base_ref\", not \"$BASE_BRANCH\". Skipped." >> "$STATE/not_ready.txt"
+            elif [ "$has_qaqc" = "true" ]; then
+              echo "#$n ($title) - has \"$QAQC_LABEL\" label. Skipped until QAQC signs off." >> "$STATE/not_ready.txt"
+            elif [ "$decision" != "APPROVED" ]; then
               echo "#$n ($title) - not approved (review state: ${decision:-none}). Chase a review." >> "$STATE/not_ready.txt"
             elif [ "$mergeable" = "CONFLICTING" ]; then
               echo "#$n ($title) - conflicts with $BASE_BRANCH. Ask @$author to rebase on the latest $BASE_BRANCH and force-push." >> "$STATE/not_ready.txt"
