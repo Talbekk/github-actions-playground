@@ -1,0 +1,286 @@
+# .github/workflows/monday-azure-dev.yml
+#
+# Fully self-contained Monday "merge to azure-dev" procedure. No external script.
+#
+#   discover -> reset & merge -> prepare (build + version bump) -> push & labels -> summary
+#
+# Behaviour:
+#   - Resets azure-dev to origin/dev, then rebases + fast-forward-merges every
+#     open PR into dev carrying the "ready for testing" label (approved PRs only).
+#   - Any rebase conflict: that PR is skipped and, if anything conflicted, the
+#     run STOPS before the prepare step and pushes NOTHING. The summary lists
+#     who to chase. Re-running is always safe (azure-dev is rebuilt from scratch).
+#   - If all clean: npm run build, bump data-version in the layout files,
+#     commit, force-push azure-dev, then swap labels on the merged PRs.
+#   - Tagging is off by default (Monday procedure - tags happen Wednesday).
+#
+# Setup (one-off):
+#   - azure-dev branch protection must allow force pushes by the pushing identity.
+#   - If the default GITHUB_TOKEN can't push (or downstream workflows must
+#     trigger off the push), add a fine-grained PAT with contents:write +
+#     pull-requests:write as the RELEASE_TOKEN secret - it's preferred if present.
+#   - Both labels ("ready for testing", "on azure-dev") must exist in the repo.
+
+name: Monday merge to azure-dev
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (print the plan, change nothing)"
+        type: boolean
+        default: true
+      prs:
+        description: "Space-separated PR numbers (blank = auto-discover by label)"
+        type: string
+        default: ""
+      version:
+        description: "data-version override, e.g. v2026-07-16-2 (blank = upcoming Thursday)"
+        type: string
+        default: ""
+      create_tag:
+        description: "Create/move the data-version tag (normally done Wednesday)"
+        type: boolean
+        default: false
+      skip_prepare:
+        description: "Skip build + version bump (merges and labels only)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: monday-azure-dev
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  REMOTE: origin
+  BASE_BRANCH: dev
+  TEST_BRANCH: azure-dev
+  READY_LABEL: ready for testing
+  MERGED_LABEL: on azure-dev
+  VERSION_FILES: source2.handlebars layouts/empty.handlebars admin.handlebars
+  COMMIT_MSG: "chore: rebuild assets, increment build number"
+  GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+  STATE: ${{ github.workspace }}/../monday-state   # outside the repo, so git never sees it
+
+jobs:
+  monday-merge:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.18.3
+          cache: npm
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # ------------------------------------------------------------------ #
+      - name: Discover ready PRs
+        id: discover
+        run: |
+          mkdir -p "$STATE"
+          : > "$STATE/plan.txt"
+          : > "$STATE/not_ready.txt"
+
+          if [ -n "${{ inputs.prs }}" ]; then
+            PR_NUMBERS="${{ inputs.prs }}"
+          else
+            PR_NUMBERS=$(gh pr list --base "$BASE_BRANCH" --state open \
+              --label "$READY_LABEL" --json number --jq '.[].number' | sort -n | tr '\n' ' ')
+          fi
+
+          for n in $PR_NUMBERS; do
+            meta=$(gh pr view "$n" --json title,author,reviewDecision)
+            title=$(jq -r '.title' <<<"$meta")
+            author=$(jq -r '.author.login' <<<"$meta")
+            decision=$(jq -r '.reviewDecision' <<<"$meta")
+
+            # GitHub computes mergeability lazily - retry UNKNOWN a few times
+            mergeable=UNKNOWN
+            for _ in 1 2 3 4 5; do
+              mergeable=$(gh pr view "$n" --json mergeable --jq '.mergeable')
+              [ "$mergeable" != "UNKNOWN" ] && break
+              sleep 3
+            done
+
+            if [ "$decision" != "APPROVED" ]; then
+              echo "#$n ($title) - not approved (review state: ${decision:-none}). Chase a review." >> "$STATE/not_ready.txt"
+            elif [ "$mergeable" = "CONFLICTING" ]; then
+              echo "#$n ($title) - conflicts with $BASE_BRANCH. Ask @$author to rebase on the latest $BASE_BRANCH and force-push." >> "$STATE/not_ready.txt"
+            else
+              echo "$n|$title|$author" >> "$STATE/plan.txt"
+            fi
+          done
+
+          echo "ready_count=$(grep -c . "$STATE/plan.txt" || true)" >> "$GITHUB_OUTPUT"
+
+          echo "== Plan =="
+          sed 's/^/  merge PR #/' "$STATE/plan.txt" || true
+          echo "== Not ready (excluded) =="
+          cat "$STATE/not_ready.txt" || true
+
+      # ------------------------------------------------------------------ #
+      - name: Reset azure-dev and merge PRs
+        id: merge
+        if: ${{ !inputs.dry_run && steps.discover.outputs.ready_count != '0' }}
+        run: |
+          : > "$STATE/merged.txt"
+          : > "$STATE/conflicted.txt"
+
+          echo "Resetting $TEST_BRANCH to $REMOTE/$BASE_BRANCH..."
+          git checkout -B "$TEST_BRANCH" "$REMOTE/$BASE_BRANCH"
+
+          while IFS='|' read -r n title author; do
+            [ -z "$n" ] && continue
+            local_branch="azure-merge/pr-$n"
+            echo "--- PR #$n: $title"
+
+            git branch -D "$local_branch" 2>/dev/null || true
+            git fetch "$REMOTE" "pull/$n/head:$local_branch"
+            git checkout "$local_branch"
+
+            if git rebase "$TEST_BRANCH"; then
+              git checkout "$TEST_BRANCH"
+              git merge --ff-only "$local_branch"
+              git branch -D "$local_branch"
+              echo "$n|$title" >> "$STATE/merged.txt"
+              echo "PR #$n merged (fast-forward)."
+            else
+              git rebase --abort || true
+              git checkout "$TEST_BRANCH"
+              git branch -D "$local_branch" 2>/dev/null || true
+              echo "#$n ($title) - rebase onto $TEST_BRANCH hit conflicts (likely overlaps a PR merged earlier in this run). Ask @$author to rebase on the latest $BASE_BRANCH, or resolve manually." >> "$STATE/conflicted.txt"
+              echo "PR #$n SKIPPED (conflicts)."
+            fi
+          done < "$STATE/plan.txt"
+
+          echo "merged_count=$(grep -c . "$STATE/merged.txt" || true)"       >> "$GITHUB_OUTPUT"
+          echo "conflict_count=$(grep -c . "$STATE/conflicted.txt" || true)" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------ #
+      - name: Prepare (build assets, bump data-version)
+        if: >-
+          ${{ !inputs.dry_run &&
+              !inputs.skip_prepare &&
+              steps.merge.outputs.conflict_count == '0' &&
+              steps.merge.outputs.merged_count != '0' }}
+        run: |
+          npm ci
+          npm run build
+
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(node -e '
+              const d = new Date();
+              const add = ((4 - d.getDay()) + 7) % 7;   // 4 = Thursday
+              d.setDate(d.getDate() + add);
+              console.log("v" + d.toISOString().slice(0, 10));
+            ')
+          fi
+          echo "$VERSION" > "$STATE/version.txt"
+          echo "Bumping data-version to $VERSION"
+
+          for f in $VERSION_FILES; do
+            [ -f "$f" ] || { echo "::error::Version file not found: $f"; exit 1; }
+            sed -E -i "s/(<head[^>]*data-version=\")[^\"]*(\")/\1${VERSION}\2/" "$f"
+            grep -q "data-version=\"$VERSION\"" "$f" || { echo "::error::Failed to set data-version in $f"; exit 1; }
+          done
+
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Build + bump produced no changes; skipping commit."
+          else
+            git add -A
+            git commit -m "$COMMIT_MSG"
+          fi
+
+          if ${{ inputs.create_tag }}; then
+            if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+              echo "Tag $VERSION exists - moving it to the latest rebuild commit."
+              git tag -d "$VERSION"
+              git push "$REMOTE" ":refs/tags/$VERSION" || true
+            fi
+            git tag "$VERSION"
+          fi
+
+      # ------------------------------------------------------------------ #
+      - name: Push azure-dev and update labels
+        if: >-
+          ${{ !inputs.dry_run &&
+              steps.merge.outputs.conflict_count == '0' &&
+              steps.merge.outputs.merged_count != '0' }}
+        run: |
+          git push --force-with-lease "$REMOTE" "$TEST_BRANCH"
+
+          if ${{ inputs.create_tag }} && [ -f "$STATE/version.txt" ]; then
+            git push "$REMOTE" "refs/tags/$(cat "$STATE/version.txt")"
+          fi
+
+          while IFS='|' read -r n title; do
+            [ -z "$n" ] && continue
+            gh pr edit "$n" --add-label "$MERGED_LABEL" --remove-label "$READY_LABEL" \
+              || echo "::warning::Could not update labels on #$n - do both labels exist?"
+          done < "$STATE/merged.txt"
+
+      # ------------------------------------------------------------------ #
+      - name: Write run summary
+        if: always()
+        run: |
+          {
+            if ${{ inputs.dry_run }}; then
+              echo "## :mag: Dry run - no changes made"
+            elif [ -s "$STATE/conflicted.txt" ]; then
+              echo "## :warning: Stopped before prepare - conflicts found. NOTHING pushed, labels unchanged."
+            elif [ -s "$STATE/merged.txt" ]; then
+              echo "## :white_check_mark: azure-dev reset, merged, prepared and pushed"
+            else
+              echo "## :zzz: No PRs ready to merge"
+            fi
+            echo ""
+
+            if [ -s "$STATE/plan.txt" ]; then
+              echo "### Planned merges"
+              awk -F'|' '{printf "- #%s: %s (@%s)\n", $1, $2, $3}' "$STATE/plan.txt"
+              echo ""
+            fi
+            if [ -s "$STATE/merged.txt" ] && ! ${{ inputs.dry_run }}; then
+              echo "### Merged onto azure-dev"
+              awk -F'|' '{printf "- #%s: %s\n", $1, $2}' "$STATE/merged.txt"
+              echo ""
+            fi
+            if [ -s "$STATE/conflicted.txt" ]; then
+              echo "### :x: Skipped - rebase conflicts (action needed)"
+              sed 's/^/- /' "$STATE/conflicted.txt"
+              echo ""
+              echo "Chase the authors above, then re-run - azure-dev is rebuilt from scratch each run, so re-running is safe."
+              echo ""
+            fi
+            if [ -s "$STATE/not_ready.txt" ]; then
+              echo "### Excluded before merging (not ready)"
+              sed 's/^/- /' "$STATE/not_ready.txt"
+              echo ""
+            fi
+            if [ -f "$STATE/version.txt" ]; then
+              echo "**data-version:** \`$(cat "$STATE/version.txt")\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail run if conflicts occurred
+        if: ${{ !inputs.dry_run && steps.merge.outputs.conflict_count != '0' && steps.merge.outputs.conflict_count != '' }}
+        run: |
+          echo "::error::One or more PRs hit rebase conflicts - nothing was pushed. See the run summary."
+          exit 1
