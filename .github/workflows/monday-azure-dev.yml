@@ -57,7 +57,7 @@ permissions:
 
 env:
   REMOTE: origin
-  BASE_BRANCH: dev
+  BASE_BRANCH: main
   TEST_BRANCH: azure-dev
   READY_LABEL: ready for testing
   MERGED_LABEL: on azure-dev
